@@ -179,8 +179,8 @@
   <div class="step-no">PART 1</div>
   <h2>The symptom: clean for months, then flaky from June 10</h2>
   <p>"Flaky" here means a run failed and then passed when Gradle retried it. No run ever failed for good.
-    Data: Develocity test history (all branches) and Hossman's Jenkins failure reports
-    (<a href="http://fucit.org/solr-jenkins-reports/">fucit.org</a>).</p>
+    Data: the test's <a href="https://develocity.apache.org/scans/tests?search.rootProjectNames=solr-root&amp;tests.container=org.apache.solr.cloud.RecoveryAfterSoftCommitTest&amp;tests.test=test">Develocity test history</a> (all branches) and its
+    <a href="http://fucit.org/solr-jenkins-reports/history-trend-of-recent-failures.html#series/org.apache.solr.cloud.RecoveryAfterSoftCommitTest.test">Jenkins failure history</a> in Hossman's reports on fucit.org.</p>
 
   <div class="tiles">
     <div class="tile"><div class="label">Feb–May 2026</div><div class="value">0</div>
@@ -199,7 +199,8 @@
 
   <h3>Jenkins weekly failure rate (Solr Jenkins jobs, all branches)</h3>
   <div id="chartJenkins"></div>
-  <p class="muted">Source: fucit.org <code>failure-rate-history.csv</code>. Two steps line up with
+  <p class="muted">Source: the test's <a href="http://fucit.org/solr-jenkins-reports/history-trend-of-recent-failures.html#series/org.apache.solr.cloud.RecoveryAfterSoftCommitTest.test">Jenkins failure history</a> on fucit.org
+    (data: <a href="http://fucit.org/solr-jenkins-reports/reports/failure-rate-history.csv"><code>failure-rate-history.csv</code></a>). Two steps line up with
     two commits: up the week #4451 merged, and down to ~2% right after SOLR-18401 started retrying
     requests that were never sent. What's left is the committed case. The two most recent main
     failures (#15202, #15239) both show it: <code>IOException occurred when talking to server</code>
@@ -598,7 +599,7 @@ if (!slowFileExists(indexDir, file.get(NAME)) || downloadCompleteIndex) {
   </dl>
 </section>
 </main>
-<footer>Sources: Develocity test history (develocity.apache.org), Jenkins failure reports and archived logs (fucit.org), apache/solr main at 79b23df58d, Jetty 12.1.14,
+<footer>Sources: <a href="https://develocity.apache.org/scans/tests?search.rootProjectNames=solr-root&amp;tests.container=org.apache.solr.cloud.RecoveryAfterSoftCommitTest&amp;tests.test=test">Develocity test history</a>, <a href="http://fucit.org/solr-jenkins-reports/history-trend-of-recent-failures.html#series/org.apache.solr.cloud.RecoveryAfterSoftCommitTest.test">Jenkins failure history</a> and archived logs (fucit.org), apache/solr main at 79b23df58d, Jetty 12.1.14,
   SOLR-18188 comments (Hossman, David Smiley), SOLR-18401 description (David Smiley), and experiment runs on 2026-10-24 (macOS laptop; Linux in Docker), including branch_9x experiments comparing both clients and an instrumented copy of the real 9x test.
   By Sanjay Dutt.</footer>
 
