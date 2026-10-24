@@ -142,6 +142,9 @@
   .verdict.fail::before { content: "✕ "; color: var(--critical); }
   .glossary dt { font-weight: 650; margin-top: 10px; }
   .glossary dd { margin: 2px 0 0 0; color: var(--text-secondary); }
+  .timeline li { margin: 8px 0; color: var(--text-secondary); }
+  .timeline b { color: var(--text-primary); }
+  .layer.key { border-left: 4px solid var(--series-1); }
   footer { max-width: 1080px; margin: 0 auto; padding: 16px 24px 48px; color: var(--text-muted); font-size: 13px; }
 </style>
 </head>
@@ -154,7 +157,7 @@
   <h1>Why <code>RecoveryAfterSoftCommitTest</code> went flaky</h1>
   <p class="lead">A test that cuts off a replica and keeps writing started failing ~15% of the time on
     main in June 2026. This page walks through the cause, one layer at a time: which client sends the
-    update, what HTTP/2 does on a connection the proxy just killed, and why Solr refuses to retry.</p>
+    update, what HTTP/2 does on a connection the proxy just killed, and why Solr refuses to retry, and why the old client on branch_9x never hit it.</p>
 </header>
 
 <nav><div class="inner">
@@ -164,6 +167,8 @@
   <a href="#s4">4 · Why no retry</a>
   <a href="#s5">5 · The experiment</a>
   <a href="#s6">6 · The fix</a>
+  <a href="#s7">7 · Why 9x never flaked</a>
+  <a href="#s8">8 · How we found it</a>
   <a href="#glossary">Glossary</a>
 </div></nav>
 
@@ -315,6 +320,110 @@
   </table>
 </section>
 
+<!-- ================= 7. WHY 9x ================= -->
+<section id="s7">
+  <div class="step-no">PART 7</div>
+  <h2>Why branch_9x never flaked</h2>
+  <p>branch_9x's test uses the old Apache HTTP/1.1 client. You might expect it to handle the cut
+    replica better. It doesn't: it was protected by a retry one layer up, and it reached the cut
+    replica less often in the first place.</p>
+  <h3>The old client fails <i>more</i> on a fresh connection, until <code>CloudSolrClient</code> retries it</h3>
+  <div id="chart9x"></div>
+  <p class="muted">Share of updates that ended in an error. Old Apache client on branch_9x, Linux (Docker).</p>
+  <details><summary>Show as a table</summary><div id="table9x"></div></details>
+
+  <h3>Where the retry lives</h3>
+  <div class="grid2">
+    <div><b>branch_9x</b>: <code>CloudLegacySolrClient.java:142</code>
+<pre>protected boolean wasCommError(Throwable rootCause) {
+  return super.wasCommError(rootCause)
+      || rootCause instanceof ConnectTimeoutException
+<span class="hl">      || rootCause instanceof NoHttpResponseException;</span>
+}</pre>
+      <p>When this is true, <code>CloudSolrClient.requestWithRetryOnStaleState</code> retries the
+        whole update, and the second attempt reaches the leader. In the pinned run, the log shows
+        <code>commError=true … retrying</code> 16 times, and no add failed.</p></div>
+    <div><b>main</b>: <code>CloudSolrClient.java:213</code> (the subclass is gone)
+<pre>protected boolean wasCommError(Throwable t) {
+  return SolrException.hasCause(t, SocketException.class)
+      || SolrException.hasCause(t, UnknownHostException.class)
+      || SolrException.hasCause(t, RequestNotSentException.class);
+}</pre>
+      <p>Jetty's <code>ClosedChannelException</code> and <code>EofException: Broken pipe</code>
+        match none of these, so there's no retry and the test fails.</p></div>
+  </div>
+
+  <h3>#4451 changed three things at once</h3>
+  <table>
+    <thead><tr><th></th><th>branch_9x (old client)</th><th>main after #4451</th></tr></thead>
+    <tbody>
+      <tr><td>How often the test client may send to the cut replica</td>
+        <td>~25%. "Any replica" went through the deprecated <b>no-op</b>
+          <code>sendUpdatesToAllReplicasInShard()</code>, so only the builder's own random roll could set it.</td>
+        <td>~50%. <code>sendUpdatesToAnyReplica()</code> works.</td></tr>
+      <tr><td>What hitting the dead connection looks like</td>
+        <td><code>NoHttpResponseException</code>, 100% on a fresh connection</td>
+        <td><code>ClosedChannelException</code> or <code>Broken pipe</code>, ~20% on Linux</td></tr>
+      <tr><td>Retried by <code>CloudSolrClient</code>?</td><td><b>yes</b>: counts as a communication error</td><td><b>no</b></td></tr>
+    </tbody>
+  </table>
+  <div class="callout">The old "immunity" was a <b>permissive replay</b>. <code>NoHttpResponseException</code>
+    means the request was written and no answer came back, so the update may already have been
+    applied. Replaying it is harmless for a plain add with a fixed id, but not for an atomic
+    <code>inc</code>. Main's client refuses that replay on purpose, which is why the fix belongs in
+    the test (#5098) rather than in bringing the retry back.</div>
+  <p class="muted">A minor factor: Apache re-checks a pooled connection after 3s idle. It then gets
+    <i>refused</i>, and its load balancer fails over to the leader (5/5 in the idle-gap rounds). In
+    the real test the connection is usually only 14–123ms old, so this rarely applies.</p>
+</section>
+
+<!-- ================= 8. HOW WE FOUND IT ================= -->
+<section id="s8">
+  <div class="step-no">PART 8</div>
+  <h2>How we found it</h2>
+  <ol class="timeline">
+    <li><b>When and where.</b> Develocity history by month, then week, then day: the first flaky
+      runs were on Jun 10–11. main and branch_10x went flaky; branch_9x stayed clean.</li>
+    <li><b>Which commit.</b> Five candidates landed on main around Jun 8–10, with different 10x
+      backport dates. 10x went flaky the day #4451 was backported (Jun 17), when the other four
+      were already there.</li>
+    <li><b>How it fails.</b> The Jenkins stack trace: the add right after <code>proxy.close()</code>,
+      sent to the cut replica's port, failing with <code>Broken pipe</code> after the request had started.</li>
+    <li><b>Down the stack.</b> The routing coin flip, then <code>LBSolrClient</code>'s rule that
+      updates are retried only if provably not sent, then <code>HttpJettySolrClient</code>'s commit
+      flag, then the Jetty source: "committed" means written to the local socket buffer.</li>
+    <li><b>Prior work.</b> Hossman and David had analysed it on SOLR-18188 in June, Nick's #5098 has
+      the test fix, and SOLR-18401 fixed the "not sent" half in August.</li>
+    <li><b>Prove the race.</b> An experiment test on main: never on macOS, ~20% on Linux, 100%
+      under load, plus a deterministic pause-then-close repro.</li>
+    <li><b>Why did 9x pass?</b> A 9x experiment comparing both clients, then the real 9x test
+      instrumented and pinned to "any replica", which revealed the cloud-level retry.</li>
+  </ol>
+
+  <h3>Theories that turned out wrong</h3>
+  <table>
+    <thead><tr><th>Theory</th><th>What disproved it</th></tr></thead>
+    <tbody>
+      <tr><td>A busy CPU makes the race likely</td><td>macOS never lost it, even with 72 busy threads. The OS (Linux) was the difference.</td></tr>
+      <tr><td>Apache noticed dead connections, got refused, and retried</td><td>Its retry handler only retries GET, and it only re-checks a connection after 3s idle.</td></tr>
+      <tr><td>The 3s re-check protects 9x</td><td>A fresh Apache connection fails 100%, and the real test's connections are 14–123ms old.</td></tr>
+      <tr><td>9x's coin flip is 50/50</td><td>9 of 10 runs were leaders-only: on 9x the "any replica" setter is a no-op.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Method lessons</h3>
+  <ul>
+    <li><b>Use branch timing as a natural experiment</b> to pick one commit out of several.</li>
+    <li><b>Measure before explaining.</b> Several plausible explanations here were wrong.</li>
+    <li><b>Make the failure deterministic</b> (pause-then-close) so it can be studied at will.</li>
+    <li><b>Test where CI runs.</b> The race doesn't show up on macOS.</li>
+    <li><b>Instrument the real path.</b> The harness said the old client fails 100%; only the real
+      test showed the retry that rescued it.</li>
+    <li><b>Expect harness bugs.</b> A wrong doc id, load-balancer state leaking between rounds, and
+      overwritten results could each have misled us.</li>
+  </ul>
+</section>
+
 <!-- ================= GLOSSARY ================= -->
 <section id="glossary">
   <div class="step-no">REFERENCE</div>
@@ -328,12 +437,14 @@
     <dt>FIN / RST / EPIPE</dt><dd>TCP close signals. After a FIN the local kernel still accepts a write; the peer answers it with an RST, and the next write fails with EPIPE, "Broken pipe".</dd>
     <dt>RequestNotSentException</dt><dd>Solr's marker that a request failed before anything was sent, so it's safe to replay elsewhere (SOLR-18401).</dd>
     <dt>Zombie</dt><dd><code>LBSolrClient</code>'s list of endpoints that failed retryably; it skips them and pings them every 60s to see if they're back.</dd>
+    <dt>wasCommError</dt><dd><code>CloudSolrClient</code>'s check for a "communication error". If true, it retries the whole request, possibly on another replica. The old <code>CloudLegacySolrClient</code> added Apache's <code>NoHttpResponseException</code> to it.</dd>
+    <dt>NoHttpResponseException</dt><dd>Apache HttpClient's error when a request was written but the connection closed before any response arrived.</dd>
     <dt>shardLeadersOnly</dt><dd>A <code>CloudSolrClient</code> setting. True: updates go straight to shard leaders. False: any active replica, shuffled. The test framework picks it at random.</dd>
   </dl>
 </section>
 </main>
 <footer>Sources: Develocity test history (develocity.apache.org), apache/solr main at 79b23df58d, Jetty 12.1.14,
-  SOLR-18188 comments (Hossman, David Smiley), and experiment runs on 2026-10-24 (macOS laptop; Linux in Docker).
+  SOLR-18188 comments (Hossman, David Smiley), and experiment runs on 2026-10-24 (macOS laptop; Linux in Docker), including branch_9x experiments comparing both clients and an instrumented copy of the real 9x test.
   By Sanjay Dutt.</footer>
 
 <div class="tooltip" id="tip"></div>
@@ -504,12 +615,47 @@
     lab(0, 1, '20%'); lab(4, 1, '100%'); lab(7, -1, '100%'); lab(7, 1, '100%');
   }
 
+  const old9x = [
+    { c: 'Fresh connection|direct', fail: 20, n: 20 },
+    { c: 'Fresh connection|via its LB', fail: 35, n: 35 },
+    { c: 'Idle 3.5s|via its LB', fail: 0, n: 5 },
+    { c: 'Real 9x test|any-replica, 80 adds', fail: 0, n: 80 },
+  ];
+  function render9x() {
+    const host = document.getElementById('chart9x'); host.innerHTML = '';
+    const W = Math.max(560, host.clientWidth || 900), H = 250, m = { t: 24, r: 16, b: 44, l: 44 };
+    const svg = el('svg', { width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: 'img',
+      'aria-label': 'Share of updates that failed with the old Apache client on branch_9x' }, host);
+    const iw = W - m.l - m.r, ih = H - m.t - m.b, y = v => m.t + ih - (v / 100) * ih;
+    [0, 50, 100].forEach(v => {
+      el('line', { x1: m.l, x2: W - m.r, y1: y(v), y2: y(v), stroke: v ? css('--grid') : css('--axis') }, svg);
+      const t = el('text', { x: m.l - 8, y: y(v) + 4, 'text-anchor': 'end', 'font-size': 12, fill: css('--text-muted') }, svg);
+      t.textContent = v + '%';
+    });
+    const band = iw / old9x.length, bw = Math.min(24, band * 0.4);
+    old9x.forEach((d, i) => {
+      const cx = m.l + band * i + band / 2, v = pct(d.fail, d.n);
+      d.c.split('|').forEach((w, k) => {
+        const t = el('text', { x: cx, y: H - 26 + k * 14, 'text-anchor': 'middle', 'font-size': 12, fill: css('--text-secondary') }, svg);
+        t.textContent = w;
+      });
+      if (v > 0) el('path', { d: colPath(cx - bw / 2, y(v), bw, y(0) - y(v)), fill: css('--series-1') }, svg);
+      else el('rect', { x: cx - bw / 2, y: y(0) - 2, width: bw, height: 2, rx: 1, fill: css('--axis') }, svg);
+      const lbl = el('text', { x: cx, y: y(v) - 6, 'text-anchor': 'middle', 'font-size': 12, fill: css('--text-primary') }, svg);
+      lbl.textContent = v ? v.toFixed(0) + '%' : '0';
+      const hit = el('rect', { x: m.l + band * i, y: m.t, width: band, height: ih, fill: 'transparent' }, svg);
+      hit.addEventListener('mousemove', e => showTip(e, `<b>${d.c.replace('|', ', ')}</b><br>${d.fail} of ${d.n} updates failed`));
+      hit.addEventListener('mouseleave', hideTip);
+    });
+  }
+
   function renderTables() {
     table('tableMonthly', ['Month', 'Runs', 'Flaky', 'Flaky %'],
       monthly.map(d => [d.m + ' 2026', d.nodata ? 'no data' : d.runs.toLocaleString(), d.nodata ? '-' : d.flaky,
         d.nodata ? '-' : pct(d.flaky, d.runs).toFixed(1) + '%']));
     table('tableBranch', ['Branch', 'Runs', 'Flaky', 'Flaky %'],
       branches.map(d => [d.b, d.runs, d.flaky, pct(d.flaky, d.runs).toFixed(1) + '%']));
+    table('table9x', ['Case', 'Failed', 'Updates'], old9x.map(d => [d.c.replace('|', ', '), d.fail, d.n]));
     table('tableExp', ['Phase', 'macOS committed', 'Linux committed'],
       exp.map(d => [d.p, `${d.mac[0]}/${d.mac[1]}`, `${d.lin[0]}/${d.lin[1]}`]));
   }
@@ -531,11 +677,11 @@
   ];
   const stackBefore = [
     stackAfter[0],
-    { name: 'CloudLegacySolrClient', role: 'same routing, same coin flip',
-      more: 'Before #4451 the test helper built an Apache-HttpClient-based client. The <code>shardLeadersOnly</code> coin flip and the shuffle were the same.' },
+    { name: 'CloudLegacySolrClient', role: 'retries "communication errors" itself; its "any replica" setter is a no-op', key: true,
+      more: 'Two differences that mattered. (1) The test helper asked for "any replica" through the deprecated no-op <code>sendUpdatesToAllReplicasInShard()</code>, so the client could reach the cut replica only ~25% of the time. (2) It overrides <code>wasCommError()</code> to include Apache\'s <code>NoHttpResponseException</code>, so <code>CloudSolrClient</code> retries the whole update, which then lands on the leader. See Part 7.' },
     stackAfter[2],
     { name: 'Apache HttpClient', role: 'HTTP/1.1, one request per connection at a time',
-      more: 'Why this client never hit the failure is <b>still open</b>. Its retry handler only retries GET (updates are POSTs), and it only re-checks a pooled connection after 3s idle (<code>VALIDATE_AFTER_INACTIVITY_DEFAULT = 3000</code>), so neither explains it. Candidates: HTTP/1.1 pools one connection per in-flight request rather than one shared session per host, so a pre-cut connection may rarely be reused; or the failure surfaces on the read and takes a retryable path. Next step: run the same experiment on branch_9x.' },
+      key: true, more: 'On a connection used within the last 3s it reuses the dead connection, writes the update, and gets <code>NoHttpResponseException</code>: 100% in the 9x experiment, and its load balancer won\'t retry an update. One layer up, <code>CloudLegacySolrClient</code> rescues it (see Part 7). Only after 3s idle does it re-check the connection, get refused, and fail over safely.' },
     stackAfter[5],
   ];
   function renderStack(which) {
@@ -544,7 +690,7 @@
     layers.forEach((L, i) => {
       if (i) { const a = document.createElement('div'); a.className = 'arrow-down'; a.textContent = '▼'; host.appendChild(a); }
       const d = document.createElement('div');
-      d.className = 'layer' + (which === 'after' && L.changed ? ' changed' : '');
+      d.className = 'layer' + (which === 'after' && L.changed ? ' changed' : '') + (which === 'before' && L.key ? ' key' : '');
       d.innerHTML = `<div class="name">${L.name}</div><div class="role">${L.role}</div><div class="more">${L.more}</div>`;
       d.addEventListener('click', () => d.classList.toggle('open'));
       host.appendChild(d);
@@ -718,9 +864,9 @@
   document.querySelectorAll('.fbtn').forEach(b => b.addEventListener('click', () => renderFlow(b.dataset.kind)));
 
   // ---------- boot ----------
-  function renderAll() { renderMonthly(); renderBranch(); renderExp(); renderSeq(); }
+  function renderAll() { renderMonthly(); renderBranch(); renderExp(); render9x(); renderSeq(); }
   renderTables(); renderStack('after'); renderFlow('committed'); renderAll();
-  window.addEventListener('resize', () => { renderMonthly(); renderBranch(); renderExp(); });
+  window.addEventListener('resize', () => { renderMonthly(); renderBranch(); renderExp(); render9x(); });
 })();
 </script>
 </body>
