@@ -305,6 +305,30 @@
 <section id="s6">
   <div class="step-no">PART 6</div>
   <h2>The fix: don't send updates to the replica you just cut off</h2>
+  <h3>First: what this test is actually for</h3>
+  <p>The test came in with <a href="https://issues.apache.org/jira/browse/SOLR-6640">SOLR-6640</a>,
+    "Replication can cause index corruption" (fix by Shalin Shekhar Mangar, Jan 2015). It checks that
+    a replica holding <b>soft-commit searchers</b> can still recover by copying the whole index after a
+    partition:</p>
+<pre>maxBufferedDocs=2    3 adds force a flush: segment files on disk, but not committed
+soft commit          a searcher opens on those flushed-but-uncommitted files
+proxy.close()        the replica is cut off; the leader keeps indexing
+numRecordsToKeep=2   the replica falls too far behind to replay updates → it needs a full index copy
+proxy.reopen()       recovery must discard the uncommitted files the searcher holds open,
+                     copy the leader's index, and come back ACTIVE without corruption</pre>
+  <p>The 2014 bug: recovery rolled back the index writer while the soft-commit searcher still held
+    those uncommitted files, so the replica ended up inconsistent with the leader. The fix closes the
+    searcher first, rolls back, and waits until the stale files are really deleted. The adds during the
+    cut exist only to push the leader past <code>numRecordsToKeep</code>; <b>which replica the
+    client sends them to is not what the test checks.</b></p>
+
+  <h3>Leaders-first client, or a retry inside the test?</h3>
+  <p>#5098 asks exactly this. Leaders-first is the right call: it delivers the adds to the leader,
+    which is all the test needs. A retry loop inside the test would replay updates that the client
+    deliberately refuses to replay (<code>CheckRetryUnrollTest</code> asserts that
+    <code>ClosedChannelException</code> is not retried). And what the client does while a replica is
+    unreachable is a separate concern, already covered by SOLR-18401's tests; if anyone wants more
+    coverage of it, it belongs in its own test.</p>
   <h3>Where the failure rate came from, and where it goes</h3>
   <table>
     <thead><tr><th>Stage</th><th>Jenkins rate</th><th>What changed</th></tr></thead>
@@ -313,11 +337,22 @@
       <tr><td><b>#4451</b>, Jun 10</td><td class="num">5–10%</td><td>Jetty HTTP/2 test client. "Any replica" routing now really happens (~50%). Dead-session errors are never retried, whether the request was sent or not.</td></tr>
       <tr><td><b>SOLR-18401</b> (David Smiley), Aug 26</td><td class="num">~2%</td><td><code>HttpJettySolrClient</code> marks failures that happened <i>before</i> the HEADERS went out as <code>RequestNotSentException</code>, and <code>LBSolrClient</code> and <code>CloudSolrClient</code> retry those safely. That removed most failures.</td></tr>
       <tr><td><b>Residual</b>, today</td><td class="num">~2%</td><td>Only the <i>committed</i> case is left: the HEADERS were written to the local socket, then the write failed. The client can't know whether the server saw it, so it correctly won't replay it. Main #15202 and #15239 are both this kind.</td></tr>
-      <tr><td><b>#5098</b> (proposed)</td><td class="num">→ 0% (expected)</td><td>Send the post-cut adds to the leader. Updates never reach the cut replica, so neither failure case can happen. No client change needed.</td></tr>
+      <tr><td><b>#5098</b> (proposed)</td><td class="num">0 / 100</td><td>Send the post-cut adds to the leader. Updates never reach the cut replica, so neither failure case can happen. No client change needed. Measured below, in the worst case.</td></tr>
     </tbody>
   </table>
-  <p class="muted">Not verified yet: the expected 0% for #5098. Running the pinned test 100 times with
-    the leaders-only client on Linux would confirm it.</p>
+  <h3>Measured: 100 runs of each variant</h3>
+  <p>Every variant forces the risky routing (updates may go to any replica) on every run, so these
+    numbers are the worst case, not the Jenkins rate. Linux in Docker, 100 iterations each.</p>
+  <table>
+    <thead><tr><th>Variant</th><th class="num">Failed</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>main, pinned to "any replica" (before)</td><td class="num"><b>16 / 100</b></td><td>All 16 are the committed case on the cut replica: 13 <code>ClosedChannelException</code>, 3 <code>Broken pipe</code>, the same as Jenkins.</td></tr>
+      <tr><td><b>main + #5098 leaders-only post-cut client</b></td><td class="num"><b>0 / 100</b></td><td>Recovery was still exercised every time: 100 cuts and reopens, and 200/200 "Replication Recovery was successful".</td></tr>
+      <tr><td>main + <code>wasCommError</code> also counting Jetty's errors</td><td class="num">pending</td><td>Would show the retry alone hides it too, but that retry isn't safe to ship.</td></tr>
+      <tr><td>branch_9x, pinned (old client, unchanged)</td><td class="num">pending</td><td>20 earlier iterations: 0 failed, 16 rescued by the <code>NoHttpResponseException</code> retry.</td></tr>
+      <tr><td>branch_9x with that retry removed</td><td class="num">pending</td><td>Should start failing if the retry is what protected 9x.</td></tr>
+    </tbody>
+  </table>
   <p>No client-side retry can be safe here: "committed" means the HEADERS left the client, and in
     general the server may have applied the update. So the fix belongs in the test. The test is about
     how the <i>leader</i> handles an unreachable replica, so its own updates should go to the leader,
@@ -431,6 +466,8 @@
     <li><b>Cross-check with Jenkins.</b> Hossman's fucit.org reports matched the Jun 8 week onset,
       showed SOLR-18401's step down to ~2%, filled Develocity's September gap, and confirmed that
       today's failures are the committed kind.</li>
+    <li><b>Measure the fix.</b> 100 runs per variant, all forcing the risky routing: 16/100 failures
+      before, 0/100 with #5098's leaders-only client, with recovery exercised every time.</li>
     <li><b>Why did 9x pass?</b> A 9x experiment comparing both clients, then the real 9x test
       instrumented and pinned to "any replica", which revealed the cloud-level retry.</li>
   </ol>
@@ -487,6 +524,8 @@
     <dt>Zombie</dt><dd><code>LBSolrClient</code>'s list of endpoints that failed retryably; it skips them and pings them every 60s to see if they're back.</dd>
     <dt>wasCommError</dt><dd><code>CloudSolrClient</code>'s check for a "communication error". If true, it retries the whole request, possibly on another replica. The old <code>CloudLegacySolrClient</code> added Apache's <code>NoHttpResponseException</code> to it.</dd>
     <dt>NoHttpResponseException</dt><dd>Apache HttpClient's error when a request was written but the connection closed before any response arrived.</dd>
+    <dt>Flush / hard commit / soft commit</dt><dd>A flush writes buffered documents as a new segment on disk, not yet committed. A hard commit writes a commit point (<code>segments_N</code>) and fsyncs. A soft commit opens a searcher straight on the writer's current state, so flushed but uncommitted segments become searchable without being durable.</dd>
+    <dt>numRecordsToKeep / PeerSync / full replication</dt><dd>A replica that missed only a few updates catches up by replaying them from the leader's update log (PeerSync). If it missed more than <code>numRecordsToKeep</code>, it has to copy the whole index from the leader (full replication, via <code>IndexFetcher</code>).</dd>
     <dt>shardLeadersOnly</dt><dd>A <code>CloudSolrClient</code> setting. True: updates go straight to shard leaders. False: any active replica, shuffled. The test framework picks it at random.</dd>
   </dl>
 </section>
