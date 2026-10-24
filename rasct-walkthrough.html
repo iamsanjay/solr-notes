@@ -179,22 +179,32 @@
   <div class="step-no">PART 1</div>
   <h2>The symptom: clean for months, then flaky from June 10</h2>
   <p>"Flaky" here means a run failed and then passed when Gradle retried it. No run ever failed for good.
-    Data: Develocity test history, all branches.</p>
+    Data: Develocity test history (all branches) and Hossman's Jenkins failure reports
+    (<a href="http://fucit.org/solr-jenkins-reports/">fucit.org</a>).</p>
 
   <div class="tiles">
     <div class="tile"><div class="label">Feb–May 2026</div><div class="value">0</div>
       <div class="sub">flaky runs out of ~3,250</div></div>
     <div class="tile"><div class="label">main since Jun 10</div><div class="value">15%</div>
-      <div class="sub">87 flaky of 579 runs</div></div>
+      <div class="sub">87 flaky of 579 runs (Develocity)</div></div>
     <div class="tile"><div class="label">branch_9x since Jun 10</div><div class="value">0%</div>
       <div class="sub">0 flaky of 476 runs</div></div>
   </div>
 
   <h3>Flaky runs per month, all branches</h3>
   <div id="chartMonthly"></div>
-  <p class="muted">September shows no recorded runs of this test in Develocity; the cause is unknown
-    (the test and its exclusion lists did not change).</p>
+  <p class="muted">Develocity has no September runs of this test. Jenkins shows it ran all month
+    (1–2% failures), so that gap is on Develocity's side.</p>
   <details><summary>Show as a table</summary><div id="tableMonthly"></div></details>
+
+  <h3>Jenkins weekly failure rate (Solr Jenkins jobs, all branches)</h3>
+  <div id="chartJenkins"></div>
+  <p class="muted">Source: fucit.org <code>failure-rate-history.csv</code>. Two steps line up with
+    two commits: up the week #4451 merged, and down to ~2% right after SOLR-18401 started retrying
+    requests that were never sent. What's left is the committed case. The two most recent main
+    failures (#15202, #15239) both show it: <code>IOException occurred when talking to server</code>
+    on the cut replica.</p>
+  <details><summary>Show as a table</summary><div id="tableJenkins"></div></details>
 
   <h3>Since June 10, by branch</h3>
   <div id="chartBranch"></div>
@@ -295,6 +305,19 @@
 <section id="s6">
   <div class="step-no">PART 6</div>
   <h2>The fix: don't send updates to the replica you just cut off</h2>
+  <h3>Where the failure rate came from, and where it goes</h3>
+  <table>
+    <thead><tr><th>Stage</th><th>Jenkins rate</th><th>What changed</th></tr></thead>
+    <tbody>
+      <tr><td>Before Jun 10</td><td class="num">0%</td><td>The old Apache client. Its <code>wasCommError()</code> retried <code>NoHttpResponseException</code>, which hid the bad routing (Part 7).</td></tr>
+      <tr><td><b>#4451</b>, Jun 10</td><td class="num">5–10%</td><td>Jetty HTTP/2 test client. "Any replica" routing now really happens (~50%). Dead-session errors are never retried, whether the request was sent or not.</td></tr>
+      <tr><td><b>SOLR-18401</b>, Aug 26</td><td class="num">~2%</td><td><code>HttpJettySolrClient</code> marks failures that happened <i>before</i> the HEADERS went out as <code>RequestNotSentException</code>, and <code>LBSolrClient</code> and <code>CloudSolrClient</code> retry those safely. That removed most failures.</td></tr>
+      <tr><td><b>Residual</b>, today</td><td class="num">~2%</td><td>Only the <i>committed</i> case is left: the HEADERS were written to the local socket, then the write failed. The client can't know whether the server saw it, so it correctly won't replay it. Main #15202 and #15239 are both this kind.</td></tr>
+      <tr><td><b>#5098</b> (proposed)</td><td class="num">→ 0% (expected)</td><td>Send the post-cut adds to the leader. Updates never reach the cut replica, so neither failure case can happen. No client change needed.</td></tr>
+    </tbody>
+  </table>
+  <p class="muted">Not verified yet: the expected 0% for #5098. Running the pinned test 100 times with
+    the leaders-only client on Linux would confirm it.</p>
   <p>No client-side retry can be safe here: "committed" means the HEADERS left the client, and in
     general the server may have applied the update. So the fix belongs in the test. The test is about
     how the <i>leader</i> handles an unreachable replica, so its own updates should go to the leader,
@@ -396,6 +419,9 @@
       the test fix, and SOLR-18401 fixed the "not sent" half in August.</li>
     <li><b>Prove the race.</b> An experiment test on main: never on macOS, ~20% on Linux, 100%
       under load, plus a deterministic pause-then-close repro.</li>
+    <li><b>Cross-check with Jenkins.</b> Hossman's fucit.org reports matched the Jun 8 week onset,
+      showed SOLR-18401's step down to ~2%, filled Develocity's September gap, and confirmed that
+      today's failures are the committed kind.</li>
     <li><b>Why did 9x pass?</b> A 9x experiment comparing both clients, then the real 9x test
       instrumented and pinned to "any replica", which revealed the cloud-level retry.</li>
   </ol>
@@ -407,6 +433,7 @@
       <tr><td>A busy CPU makes the race likely</td><td>macOS never lost it, even with 72 busy threads. The OS (Linux) was the difference.</td></tr>
       <tr><td>Apache noticed dead connections, got refused, and retried</td><td>Its retry handler only retries GET, and it only re-checks a connection after 3s idle.</td></tr>
       <tr><td>The 3s re-check protects 9x</td><td>A fresh Apache connection fails 100%, and the real test's connections are 14–123ms old.</td></tr>
+      <tr><td>Develocity's empty September means the test didn't run</td><td>Jenkins shows it ran all month with 1–2% failures: a Develocity data gap.</td></tr>
       <tr><td>9x's coin flip is 50/50</td><td>9 of 10 runs were leaders-only: on 9x the "any replica" setter is a no-op.</td></tr>
     </tbody>
   </table>
@@ -443,7 +470,7 @@
   </dl>
 </section>
 </main>
-<footer>Sources: Develocity test history (develocity.apache.org), apache/solr main at 79b23df58d, Jetty 12.1.14,
+<footer>Sources: Develocity test history (develocity.apache.org), Jenkins failure reports and archived logs (fucit.org), apache/solr main at 79b23df58d, Jetty 12.1.14,
   SOLR-18188 comments (Hossman, David Smiley), and experiment runs on 2026-10-24 (macOS laptop; Linux in Docker), including branch_9x experiments comparing both clients and an instrumented copy of the real 9x test.
   By Sanjay Dutt.</footer>
 
@@ -503,6 +530,14 @@
     { p: 'load 200µs', mac: [0, 10], lin: [1, 10] }, { p: 'pause-then-close', mac: [5, 5], lin: [5, 5] },
   ];
   const pct = (a, b) => b ? (100 * a / b) : 0;
+  const jenkins = [
+    ['Apr 6', 0], ['Apr 13', 0], ['Apr 20', 0], ['Apr 27', 0], ['May 4', 0], ['May 11', 0],
+    ['May 18', 0], ['May 25', 0], ['Jun 1', 0], ['Jun 8', 3.39], ['Jun 15', 5.11], ['Jun 22', 5.67],
+    ['Jun 29', 8.10], ['Jul 6', 6.91], ['Jul 13', 7.25], ['Jul 20', 7.21], ['Jul 27', 3.96],
+    ['Aug 3', 9.76], ['Aug 10', 10.54], ['Aug 17', 6.60], ['Aug 24', 7.85], ['Aug 31', 0.99],
+    ['Sep 7', 1.58], ['Sep 14', 1.25], ['Sep 21', 1.94], ['Sep 28', 1.64], ['Oct 5', 2.46],
+    ['Oct 12', 1.98], ['Oct 19', 2.26],
+  ];
 
   // ---------- chart: monthly ----------
   function renderMonthly() {
@@ -545,6 +580,43 @@
     };
     annot(4, 0.32, 'Jun 10: #4451 switches the test client to Jetty HTTP/2', 0);
     annot(6, 0.84, 'Aug 26: SOLR-18401 retries "not sent"', 14);
+  }
+
+  // ---------- chart: Jenkins weekly ----------
+  function renderJenkins() {
+    const host = document.getElementById('chartJenkins'); host.innerHTML = '';
+    const W = Math.max(560, host.clientWidth || 900), H = 250, m = { t: 30, r: 16, b: 34, l: 44 };
+    const svg = el('svg', { width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: 'img',
+      'aria-label': 'Jenkins weekly failure rate of RecoveryAfterSoftCommitTest' }, host);
+    const iw = W - m.l - m.r, ih = H - m.t - m.b, max = 12, y = v => m.t + ih - (v / max) * ih;
+    [0, 4, 8, 12].forEach(v => {
+      el('line', { x1: m.l, x2: W - m.r, y1: y(v), y2: y(v), stroke: v ? css('--grid') : css('--axis') }, svg);
+      const t = el('text', { x: m.l - 8, y: y(v) + 4, 'text-anchor': 'end', 'font-size': 12, fill: css('--text-muted') }, svg);
+      t.textContent = v + '%';
+    });
+    const band = iw / jenkins.length, bw = Math.min(24, band * 0.6);
+    jenkins.forEach(([wk, v], i) => {
+      const cx = m.l + band * i + band / 2;
+      if (i % 4 === 0) {
+        const t = el('text', { x: cx, y: H - 12, 'text-anchor': 'middle', 'font-size': 11, fill: css('--text-secondary') }, svg);
+        t.textContent = wk;
+      }
+      if (v > 0) el('path', { d: colPath(cx - bw / 2, y(v), bw, y(0) - y(v)), fill: css('--series-1') }, svg);
+      else el('rect', { x: cx - bw / 2, y: y(0) - 2, width: bw, height: 2, rx: 1, fill: css('--axis') }, svg);
+      const hit = el('rect', { x: m.l + band * i, y: m.t, width: band, height: ih, fill: 'transparent' }, svg);
+      hit.addEventListener('mousemove', e => showTip(e, `<b>Week of ${wk} 2026</b><br>${v.toFixed(2)}% of Jenkins runs failed`));
+      hit.addEventListener('mouseleave', hideTip);
+    });
+    const annot = (i, text, dy) => {
+      const x = m.l + band * i;
+      el('line', { x1: x, x2: x, y1: m.t - 6 + dy, y2: y(0), stroke: css('--text-muted'), 'stroke-width': 1 }, svg);
+      const t = el('text', { x: x + 4, y: m.t - 10 + dy, 'font-size': 11, fill: css('--text-secondary') }, svg);
+      t.textContent = text;
+    };
+    annot(9, '#4451 (Jun 10)', 0);
+    annot(21, 'SOLR-18401 (Aug 26)', 0);
+    const peak = el('text', { x: m.l + band * 18 + band / 2, y: y(10.54) - 6, 'text-anchor': 'middle', 'font-size': 12, fill: css('--text-primary') }, svg);
+    peak.textContent = '10.5%';
   }
 
   // ---------- chart: branch (horizontal bars) ----------
@@ -653,6 +725,7 @@
     table('tableMonthly', ['Month', 'Runs', 'Flaky', 'Flaky %'],
       monthly.map(d => [d.m + ' 2026', d.nodata ? 'no data' : d.runs.toLocaleString(), d.nodata ? '-' : d.flaky,
         d.nodata ? '-' : pct(d.flaky, d.runs).toFixed(1) + '%']));
+    table('tableJenkins', ['Week of (2026)', 'Failure rate'], jenkins.map(([w, v]) => [w, v.toFixed(2) + '%']));
     table('tableBranch', ['Branch', 'Runs', 'Flaky', 'Flaky %'],
       branches.map(d => [d.b, d.runs, d.flaky, pct(d.flaky, d.runs).toFixed(1) + '%']));
     table('table9x', ['Case', 'Failed', 'Updates'], old9x.map(d => [d.c.replace('|', ', '), d.fail, d.n]));
@@ -664,8 +737,8 @@
   const stackAfter = [
     { name: 'The test', role: 'cloudClient.add(doc) right after proxy.close()',
       more: '<code>RecoveryAfterSoftCommitTest.java:106</code>. The test cuts the non-leader replica off with <code>proxy.close()</code>, then adds more docs.' },
-    { name: 'CloudSolrClient', role: 'picks which replicas to try', changed: true,
-      more: 'Built by <code>createNewCloudSolrClient(…, random().nextBoolean(), …)</code>. When <code>shardLeadersOnly</code> is false, <code>sendRequest()</code> skips the leader-aware <code>directUpdate</code> path and lists every <b>ACTIVE</b> replica, shuffled. Right after the cut, ZooKeeper still shows the cut replica as ACTIVE, so it can come first.' },
+    { name: 'CloudSolrClient', role: 'picks which replicas to try; retries "communication errors"', changed: true,
+      more: 'Built by <code>createNewCloudSolrClient(…, random().nextBoolean(), …)</code>. Since #4451 the "any replica" side of that coin flip really takes effect (~50%); before, the helper called a no-op setter, so it happened only ~25% of the time (Part 7). Its <code>wasCommError()</code> retries only <code>SocketException</code>, <code>UnknownHostException</code> and <code>RequestNotSentException</code>, not Jetty\'s dead-session errors. When <code>shardLeadersOnly</code> is false, <code>sendRequest()</code> skips the leader-aware <code>directUpdate</code> path and lists every <b>ACTIVE</b> replica, shuffled. Right after the cut, ZooKeeper still shows the cut replica as ACTIVE, so it can come first.' },
     { name: 'LBSolrClient', role: 'tries endpoints in order, decides whether to retry',
       more: 'Updates are non-retryable unless the error proves nothing was sent (connect failure or <code>RequestNotSentException</code>). See Part 4.' },
     { name: 'HttpJettySolrClient', role: 'turns Jetty errors into SolrServerException', changed: true,
@@ -864,9 +937,9 @@
   document.querySelectorAll('.fbtn').forEach(b => b.addEventListener('click', () => renderFlow(b.dataset.kind)));
 
   // ---------- boot ----------
-  function renderAll() { renderMonthly(); renderBranch(); renderExp(); render9x(); renderSeq(); }
+  function renderAll() { renderMonthly(); renderJenkins(); renderBranch(); renderExp(); render9x(); renderSeq(); }
   renderTables(); renderStack('after'); renderFlow('committed'); renderAll();
-  window.addEventListener('resize', () => { renderMonthly(); renderBranch(); renderExp(); render9x(); });
+  window.addEventListener('resize', () => { renderMonthly(); renderJenkins(); renderBranch(); renderExp(); render9x(); });
 })();
 </script>
 </body>
