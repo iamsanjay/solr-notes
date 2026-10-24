@@ -366,8 +366,37 @@ if (!slowFileExists(indexDir, file.get(NAME)) || downloadCompleteIndex) {
     </tbody>
   </table>
   <h3>Measured: 100 runs of each variant</h3>
-  <p>Every variant forces the risky routing (updates may go to any replica) on every run, so these
-    numbers are the worst case, not the Jenkins rate. Linux in Docker, 100 iterations each.</p>
+  <p>Each variant starts from the real <code>RecoveryAfterSoftCommitTest</code> and changes exactly one
+    thing. Two of them change <code>wasCommError()</code>: when a request fails,
+    <code>CloudSolrClient</code> asks it whether this was a communication problem, and if so refreshes
+    cluster state and <b>retries the whole request</b>, possibly on another replica. Otherwise the error
+    goes straight back to the caller.</p>
+  <table>
+    <thead><tr><th>Variant (test class)</th><th>What it changes</th><th>Question it answers</th></tr></thead>
+    <tbody>
+      <tr><td><b>main, pinned</b><br><code>RecoveryAfterSoftCommitAnyReplicaTest</code></td>
+        <td>Builds the client with <code>sendUpdatesToAnyReplica()</code> on every run instead of the random coin flip.</td>
+        <td>How often does it fail when the risky routing always happens?</td></tr>
+      <tr><td><b>main + #5098</b><br><code>…LeadersOnlyTest</code></td>
+        <td>Same, but the adds <i>after</i> <code>proxy.close()</code> go through a leaders-only client,
+          <code>createNewCloudSolrClient(…, true, …)</code>.</td>
+        <td>Does the proposed fix remove the failures, and is recovery still tested?</td></tr>
+      <tr><td><b>main + wider <code>wasCommError</code></b><br><code>…WideRetryTest</code></td>
+        <td>Same as pinned, but the client is a <code>CloudHttp2SolrClient</code> subclass whose
+          <code>wasCommError()</code> also returns true for <code>ClosedChannelException</code> and
+          <code>EOFException</code> (Jetty's <code>EofException</code>).</td>
+        <td>Is the missing retry the whole cause? A proof, not a fix: it replays committed updates.</td></tr>
+      <tr><td><b>branch_9x, pinned</b><br><code>…AnyReplica9xTest</code></td>
+        <td>branch_9x's old Apache client, forced to any-replica (bypassing the no-op setter), with routing logged.</td>
+        <td>Does the old client survive the risky routing?</td></tr>
+      <tr><td><b>branch_9x, retry removed</b><br><code>…NarrowRetry9xTest</code></td>
+        <td>Same, but the old client's <code>wasCommError()</code> drops <code>NoHttpResponseException</code>,
+          back to the base rule.</td>
+        <td>Does the old client fail once its retry is gone?</td></tr>
+    </tbody>
+  </table>
+  <p>Results. Every variant forces the risky routing (updates may go to any replica) on every run, so
+    these numbers are the worst case, not the Jenkins rate. Linux in Docker, 100 iterations each.</p>
   <table>
     <thead><tr><th>Variant</th><th class="num">Failed</th><th>Notes</th></tr></thead>
     <tbody>
