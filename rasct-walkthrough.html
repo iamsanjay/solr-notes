@@ -306,6 +306,15 @@
   <div class="step-no">PART 6</div>
   <h2>The fix: don't send updates to the replica you just cut off</h2>
   <h3>First: what this test is actually for</h3>
+  <p>It helps to know the three states a document goes through in Lucene:</p>
+  <table>
+    <thead><tr><th>State</th><th>Where it lives</th><th>Searchable?</th><th>Survives a crash?</th></tr></thead>
+    <tbody>
+      <tr><td><b>Buffered</b></td><td>RAM inside <code>IndexWriter</code></td><td>no</td><td>no</td></tr>
+      <tr><td><b>Flushed</b></td><td>new segment files on disk (<code>_0.cfs</code>…), not listed in any commit point</td><td>only through a near-real-time searcher (soft commit)</td><td>no: no commit point mentions them</td></tr>
+      <tr><td><b>Committed</b></td><td>listed in <code>segments_N</code>, fsynced (hard commit)</td><td>yes, by any reader</td><td>yes</td></tr>
+    </tbody>
+  </table>
   <p>The test came in with <a href="https://issues.apache.org/jira/browse/SOLR-6640">SOLR-6640</a>,
     "Replication can cause index corruption" (fix by Shalin Shekhar Mangar, Jan 2015). It checks that
     a replica holding <b>soft-commit searchers</b> can still recover by copying the whole index after a
@@ -316,11 +325,27 @@ proxy.close()        the replica is cut off; the leader keeps indexing
 numRecordsToKeep=2   the replica falls too far behind to replay updates → it needs a full index copy
 proxy.reopen()       recovery must discard the uncommitted files the searcher holds open,
                      copy the leader's index, and come back ACTIVE without corruption</pre>
-  <p>The 2014 bug: recovery rolled back the index writer while the soft-commit searcher still held
-    those uncommitted files, so the replica ended up inconsistent with the leader. The fix closes the
-    searcher first, rolls back, and waits until the stale files are really deleted. The adds during the
-    cut exist only to push the leader past <code>numRecordsToKeep</code>; <b>which replica the
-    client sends them to is not what the test checks.</b></p>
+  <p><b>The 2014 bug.</b> Leader and replica each name their own segment files (<code>_0.cfs</code>,
+    <code>_1.cfs</code>…), so the same name can hold different documents on each node. During the full
+    copy, the replica rolled back its writer to discard its uncommitted segments, but its soft-commit
+    searcher still held them open, so the stale files survived. The fetcher then skipped any leader
+    file whose <i>name</i> already existed locally:</p>
+<pre>// SnapPuller.downloadIndexFiles(), 2014
+if (!slowFileExists(indexDir, file.get(NAME)) || downloadCompleteIndex) {
+  ... fetch from the leader ...
+} else {
+<span class="hl">  LOG.info("Skipping download for " + file.get(NAME) + " because it already exists");</span>
+}</pre>
+  <p>Its only guard, <code>isIndexStale()</code>, compared sizes. A leftover file with the leader's name
+    and size was kept, the replica took the leader's commit point, and that commit point now pointed at
+    the replica's own different documents: <i>"shard2 is not consistent. Got 62 … and got 24"</i>. It
+    needed all of: a soft-commit searcher on uncommitted segments, a full copy rather than an update
+    replay, and a same-named, same-sized leftover. The leader was never affected. The fix closes the
+    searcher first, rolls back, and waits until the stale files are really deleted, falling back to a
+    copy into a fresh directory. (The name-and-size mechanism is our reading of the 2014 code and the
+    fix's comments, not reproduced.)</p>
+  <p>The adds during the cut exist only to push the leader past <code>numRecordsToKeep</code>;
+    <b>which replica the client sends them to is not what the test checks.</b></p>
 
   <h3>Leaders-first client, or a retry inside the test?</h3>
   <p>#5098 asks exactly this. Leaders-first is the right call: it delivers the adds to the leader,
@@ -495,6 +520,20 @@ proxy.reopen()       recovery must discard the uncommitted files the searcher ho
       <tr><td>9x's coin flip is 50/50</td><td>9 of 10 runs were leaders-only: on 9x the "any replica" setter is a no-op.</td></tr>
     </tbody>
   </table>
+
+  <h3>Epilogue: what one flaky test revealed</h3>
+  <p>A test written in 2015 to catch one bug ended up exposing two more. Each time it went flaky, it
+    pointed one layer deeper:</p>
+  <ul>
+    <li><b>2015:</b> an index-corruption bug in recovery with soft-commit searchers (SOLR-6640).</li>
+    <li><b>Aug 2026:</b> a real SolrJ regression. Production clients behind idle-timeout load balancers
+      or firewalls would get hard failures on requests that never reached Solr. SOLR-18401's own write-up
+      says how it was found: <i>"RecoveryAfterSoftCommitTest went from zero CI failures to a sustained
+      3-10% failure rate."</i></li>
+    <li><b>Today:</b> its last ~2% marks the edge of what a client can safely replay, and shows the test's
+      own routing was the remaining problem (#5098).</li>
+  </ul>
+  <p>Treat a flaky test as a signal, not noise.</p>
 
   <h3>Method lessons</h3>
   <ul>
