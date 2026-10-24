@@ -311,7 +311,7 @@
     <tbody>
       <tr><td>Before Jun 10</td><td class="num">0%</td><td>The old Apache client. Its <code>wasCommError()</code> retried <code>NoHttpResponseException</code>, which hid the bad routing (Part 7).</td></tr>
       <tr><td><b>#4451</b>, Jun 10</td><td class="num">5–10%</td><td>Jetty HTTP/2 test client. "Any replica" routing now really happens (~50%). Dead-session errors are never retried, whether the request was sent or not.</td></tr>
-      <tr><td><b>SOLR-18401</b>, Aug 26</td><td class="num">~2%</td><td><code>HttpJettySolrClient</code> marks failures that happened <i>before</i> the HEADERS went out as <code>RequestNotSentException</code>, and <code>LBSolrClient</code> and <code>CloudSolrClient</code> retry those safely. That removed most failures.</td></tr>
+      <tr><td><b>SOLR-18401</b> (David Smiley), Aug 26</td><td class="num">~2%</td><td><code>HttpJettySolrClient</code> marks failures that happened <i>before</i> the HEADERS went out as <code>RequestNotSentException</code>, and <code>LBSolrClient</code> and <code>CloudSolrClient</code> retry those safely. That removed most failures.</td></tr>
       <tr><td><b>Residual</b>, today</td><td class="num">~2%</td><td>Only the <i>committed</i> case is left: the HEADERS were written to the local socket, then the write failed. The client can't know whether the server saw it, so it correctly won't replay it. Main #15202 and #15239 are both this kind.</td></tr>
       <tr><td><b>#5098</b> (proposed)</td><td class="num">→ 0% (expected)</td><td>Send the post-cut adds to the leader. Updates never reach the cut replica, so neither failure case can happen. No client change needed.</td></tr>
     </tbody>
@@ -350,6 +350,11 @@
   <p>branch_9x's test uses the old Apache HTTP/1.1 client. You might expect it to handle the cut
     replica better. It doesn't: it was protected by a retry one layer up, and it reached the cut
     replica less often in the first place.</p>
+  <div class="callout blue"><b>Credit:</b> David Smiley identified the retry part in
+    <a href="https://issues.apache.org/jira/browse/SOLR-18401">SOLR-18401</a> (Aug 24, 2026), naming
+    the <code>CloudLegacySolrClient.wasCommError()</code> override as the regression from SOLR-18188
+    and designing the commit-based fix. This part measures that mechanism in the real 9x test, and
+    adds the routing difference and an explanation for the remaining failures.</div>
   <h3>The old client fails <i>more</i> on a fresh connection, until <code>CloudSolrClient</code> retries it</h3>
   <div id="chart9x"></div>
   <p class="muted">Share of updates that ended in an error. Old Apache client on branch_9x, Linux (Docker).</p>
@@ -390,11 +395,14 @@
       <tr><td>Retried by <code>CloudSolrClient</code>?</td><td><b>yes</b>: counts as a communication error</td><td><b>no</b></td></tr>
     </tbody>
   </table>
-  <div class="callout">The old "immunity" was a <b>permissive replay</b>. <code>NoHttpResponseException</code>
-    means the request was written and no answer came back, so the update may already have been
-    applied. Replaying it is harmless for a plain add with a fixed id, but not for an atomic
-    <code>inc</code>. Main's client refuses that replay on purpose, which is why the fix belongs in
-    the test (#5098) rather than in bringing the retry back.</div>
+  <div class="callout">The old "immunity" was a <b>permissive replay</b>. SOLR-18401 describes
+    <code>NoHttpResponseException</code> as "provably never processed", but Apache raises it <i>after</i>
+    writing the request, when no response comes back. In the 9x runs it fired on fully written
+    requests. So the old client also replayed the <i>committed</i> case, which is why it showed 0%.
+    SOLR-18401's rule is stricter: it retries only requests whose headers never left, and refuses
+    exactly the committed case. That is the ~2% that remains. Replaying a committed update is
+    harmless for a plain add with a fixed id, but not for an atomic <code>inc</code>, which is why the
+    fix belongs in the test (#5098) rather than in bringing the old retry back.</div>
   <p class="muted">A minor factor: Apache re-checks a pooled connection after 3s idle. It then gets
     <i>refused</i>, and its load balancer fails over to the leader (5/5 in the idle-gap rounds). In
     the real test the connection is usually only 14–123ms old, so this rarely applies.</p>
@@ -415,8 +423,9 @@
     <li><b>Down the stack.</b> The routing coin flip, then <code>LBSolrClient</code>'s rule that
       updates are retried only if provably not sent, then <code>HttpJettySolrClient</code>'s commit
       flag, then the Jetty source: "committed" means written to the local socket buffer.</li>
-    <li><b>Prior work.</b> Hossman and David had analysed it on SOLR-18188 in June, Nick's #5098 has
-      the test fix, and SOLR-18401 fixed the "not sent" half in August.</li>
+    <li><b>Prior work.</b> Hossman and David analysed the flakiness on SOLR-18188 in June. In
+      SOLR-18401 (Aug 24) David traced the regression to the lost <code>wasCommError</code> retry,
+      used the same fucit.org rates, and shipped the "not sent" fix. Nick's #5098 has the test fix.</li>
     <li><b>Prove the race.</b> An experiment test on main: never on macOS, ~20% on Linux, 100%
       under load, plus a deterministic pause-then-close repro.</li>
     <li><b>Cross-check with Jenkins.</b> Hossman's fucit.org reports matched the Jun 8 week onset,
@@ -425,6 +434,18 @@
     <li><b>Why did 9x pass?</b> A 9x experiment comparing both clients, then the real 9x test
       instrumented and pinned to "any replica", which revealed the cloud-level retry.</li>
   </ol>
+
+  <h3>What this investigation adds to SOLR-18188 and SOLR-18401</h3>
+  <ul>
+    <li><b>The residual ~2%, explained:</b> the old client also replayed committed requests
+      (<code>NoHttpResponseException</code> fires after the write). The new rule refuses those, and
+      only routing to the leader removes them.</li>
+    <li><b>The routing difference:</b> on 9x the helper's "any replica" was a no-op setter (~25%
+      exposure); #4451 made it real (~50%).</li>
+    <li><b>The race is Linux-only</b> (never on macOS), with a deterministic pause-then-close repro.</li>
+    <li><b>The 8% → 2% drop, quantified:</b> about 4 in 5 hits fail "not sent", which is exactly what
+      SOLR-18401 retries.</li>
+  </ul>
 
   <h3>Theories that turned out wrong</h3>
   <table>
@@ -471,7 +492,7 @@
 </section>
 </main>
 <footer>Sources: Develocity test history (develocity.apache.org), Jenkins failure reports and archived logs (fucit.org), apache/solr main at 79b23df58d, Jetty 12.1.14,
-  SOLR-18188 comments (Hossman, David Smiley), and experiment runs on 2026-10-24 (macOS laptop; Linux in Docker), including branch_9x experiments comparing both clients and an instrumented copy of the real 9x test.
+  SOLR-18188 comments (Hossman, David Smiley), SOLR-18401 description (David Smiley), and experiment runs on 2026-10-24 (macOS laptop; Linux in Docker), including branch_9x experiments comparing both clients and an instrumented copy of the real 9x test.
   By Sanjay Dutt.</footer>
 
 <div class="tooltip" id="tip"></div>
