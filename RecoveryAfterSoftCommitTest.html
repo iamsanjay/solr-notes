@@ -142,6 +142,9 @@
   .verdict.fail::before { content: "✕ "; color: var(--critical); }
   .glossary dt { font-weight: 650; margin-top: 10px; }
   .glossary dd { margin: 2px 0 0 0; color: var(--text-secondary); }
+  .story { border-left: 4px solid var(--series-1); margin-top: 20px; }
+  .story ol li { margin: 6px 0; color: var(--text-secondary); }
+  .story ol b { color: var(--text-primary); }
   .timeline li { margin: 8px 0; color: var(--text-secondary); }
   .timeline b { color: var(--text-primary); }
   .layer.key { border-left: 4px solid var(--series-1); }
@@ -158,6 +161,38 @@
   <p class="lead">A test that cuts off a replica and keeps writing started failing ~15% of the time on
     main in June 2026. This page walks through the cause, one layer at a time: which client sends the
     update, what HTTP/2 does on a connection the proxy just killed, and why Solr refuses to retry, and why the old client on branch_9x never hit it.</p>
+
+  <section class="story">
+    <h2>Just here for the story? Start here.</h2>
+    <p><b>Solr</b> is a search engine that keeps several copies (<i>replicas</i>) of each piece of an
+      index on different machines. If one machine drops off the network for a while, it has to catch
+      up when it comes back. <code>RecoveryAfterSoftCommitTest</code> checks exactly that: it cuts one
+      replica off on purpose, keeps writing, reconnects it, and checks that it recovers cleanly.</p>
+    <p>For months the test passed every time. Then one day in June 2026 it started failing now and
+    then, up to one run in ten, and nobody had touched the test. A test that fails "sometimes" is
+    called <b>flaky</b>, and the tempting move is to shrug and rerun it. This page is what happens if
+    you don't.</p>
+    <p>The short version:</p>
+    <ol>
+      <li><b>A change elsewhere</b> swapped the HTTP client the test uses for a newer one.</li>
+      <li>Sometimes the test's own writes went to the very replica it had just cut off. The new client
+        reuses connections, and on Linux it can start sending a request down a connection that is
+        already dead before it notices.</li>
+      <li>At that point the client <b>can't know</b> whether the server got the request, so it refuses
+        to resend it. That's the safe choice, because resending could apply a write twice. The test
+        fails.</li>
+      <li>The twist: the old client "never failed" only because it <b>quietly resent</b> those requests,
+        the less safe choice. The bug was hiding behind a bad habit.</li>
+      <li>The fix is a few lines in the test: send its writes to the healthy copy. In 100 runs of the
+        worst case, that took failures from 16 to 0.</li>
+    </ol>
+    <p>Along the way, a 2015 index-corruption bug, a Linux-only race and a setting that silently did
+      nothing all turn up. This one test has now caught three different problems in eleven years.</p>
+    <p class="muted"><b>How to read this:</b> curious about <i>why</i> it failed? Click through the
+      animation in <a href="#s3">Part 3</a>. Prefer the detective story, wrong guesses included? Go to
+      <a href="#s8">Part 8</a>. Want the evidence? Parts 1, 5 and 7 have the charts and numbers. Unfamiliar
+      word? See the <a href="#glossary">glossary</a> at the bottom.</p>
+  </section>
 </header>
 
 <nav><div class="inner">
