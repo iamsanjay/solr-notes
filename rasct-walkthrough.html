@@ -373,7 +373,7 @@ if (!slowFileExists(indexDir, file.get(NAME)) || downloadCompleteIndex) {
     <tbody>
       <tr><td>main, pinned to "any replica" (before)</td><td class="num"><b>16 / 100</b></td><td>All 16 are the committed case on the cut replica: 13 <code>ClosedChannelException</code>, 3 <code>Broken pipe</code>, the same as Jenkins.</td></tr>
       <tr><td><b>main + #5098 leaders-only post-cut client</b></td><td class="num"><b>0 / 100</b></td><td>Recovery was still exercised every time: 100 cuts and reopens, and 200/200 "Replication Recovery was successful".</td></tr>
-      <tr><td>main + <code>wasCommError</code> also counting Jetty's errors</td><td class="num">pending</td><td>Would show the retry alone hides it too, but that retry isn't safe to ship.</td></tr>
+      <tr><td>main + <code>wasCommError</code> also counting Jetty's errors</td><td class="num"><b>0 / 100</b></td><td><code>CloudSolrClient</code> caught and retried 17 would-be failures (15 <code>ClosedChannelException</code>, 2 <code>Broken pipe</code>), matching the 16 in the unchanged run. The missing retry accounts for the whole residual, but this cure replays committed updates, so it isn't safe to ship.</td></tr>
       <tr><td>branch_9x, pinned (old client, unchanged)</td><td class="num">pending</td><td>20 earlier iterations: 0 failed, 16 rescued by the <code>NoHttpResponseException</code> retry.</td></tr>
       <tr><td>branch_9x with that retry removed</td><td class="num">pending</td><td>Should start failing if the retry is what protected 9x.</td></tr>
     </tbody>
