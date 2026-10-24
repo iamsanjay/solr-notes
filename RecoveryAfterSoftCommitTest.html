@@ -181,13 +181,16 @@
       <li>At that point the client <b>can't know</b> whether the server got the request, so it refuses
         to resend it. That's the safe choice, because resending could apply a write twice. The test
         fails.</li>
-      <li>The twist: the old client "never failed" only because it <b>quietly resent</b> those requests,
-        the less safe choice. The bug was hiding behind a bad habit.</li>
+      <li>The twist: the old client "never failed" because it <b>resent</b> those requests, a more
+        forgiving choice that suited its older transport. That behaviour kept the test's routing
+        problem out of sight.</li>
       <li>The fix is a few lines in the test: send its writes to the healthy copy. In 100 runs of the
         worst case, that took failures from 16 to 0.</li>
     </ol>
-    <p>Along the way, a 2015 index-corruption bug, a Linux-only race and a setting that silently did
-      nothing all turn up. This one test has now caught three different problems in eleven years.</p>
+    <p>Along the way: why the test exists at all (it was written in 2015 to guard against an
+      index-corruption bug), a race that only shows up on Linux, and a setting that silently did
+      nothing. Eleven years after it was written, the same test exposed a real client regression,
+      and its last failures pointed back at the test itself.</p>
     <p class="muted"><b>How to read this:</b> curious about <i>why</i> it failed? Click through the
       animation in <a href="#s3">Part 3</a>. Prefer the detective story, wrong guesses included? Go to
       <a href="#s8">Part 8</a>. Want the evidence? Parts 1, 5 and 7 have the charts and numbers. Unfamiliar
@@ -587,10 +590,12 @@ if (!slowFileExists(indexDir, file.get(NAME)) || downloadCompleteIndex) {
   </table>
 
   <h3>Epilogue: what one flaky test revealed</h3>
-  <p>A test written in 2015 to catch one bug ended up exposing two more. Each time it went flaky, it
-    pointed one layer deeper:</p>
+  <p>The test was written in 2015 as the regression test for one bug. Eleven years later, its
+    flakiness pointed at two more things, each one layer deeper:</p>
   <ul>
-    <li><b>2015:</b> an index-corruption bug in recovery with soft-commit searchers (SOLR-6640).</li>
+    <li><b>2015, why it exists:</b> an index-corruption bug in recovery with soft-commit searchers
+      (SOLR-6640). That bug was found through <code>ChaosMonkeySafeLeaderTest</code>; this test came in
+      with the fix, to keep it from coming back.</li>
     <li><b>Aug 2026:</b> a real SolrJ regression. Production clients behind idle-timeout load balancers
       or firewalls would get hard failures on requests that never reached Solr. SOLR-18401's own write-up
       says how it was found: <i>"RecoveryAfterSoftCommitTest went from zero CI failures to a sustained
