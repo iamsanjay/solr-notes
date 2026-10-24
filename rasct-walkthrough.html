@@ -535,7 +535,7 @@
       more: 'Before #4451 the test helper built an Apache-HttpClient-based client. The <code>shardLeadersOnly</code> coin flip and the shuffle were the same.' },
     stackAfter[2],
     { name: 'Apache HttpClient', role: 'HTTP/1.1, one request per connection at a time',
-      more: 'Validates idle pooled connections before reuse (<code>setValidateAfterInactivity</code>). A dead connection is usually discarded, and the new connect to the closed proxy fails with <i>connection refused</i>, a <code>ConnectException</code>, which LBSolrClient does retry. (Inferred from the old code, not stepped through.)' },
+      more: 'Why this client never hit the failure is <b>still open</b>. Its retry handler only retries GET (updates are POSTs), and it only re-checks a pooled connection after 3s idle (<code>VALIDATE_AFTER_INACTIVITY_DEFAULT = 3000</code>), so neither explains it. Candidates: HTTP/1.1 pools one connection per in-flight request rather than one shared session per host, so a pre-cut connection may rarely be reused; or the failure surfaces on the read and takes a retryable path. Next step: run the same experiment on branch_9x.' },
     stackAfter[5],
   ];
   function renderStack(which) {
