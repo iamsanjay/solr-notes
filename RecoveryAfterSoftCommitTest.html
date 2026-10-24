@@ -442,10 +442,14 @@ if (!slowFileExists(indexDir, file.get(NAME)) || downloadCompleteIndex) {
       <tr><td>main, pinned to "any replica" (before)</td><td class="num"><b>16 / 100</b></td><td>All 16 are the committed case on the cut replica: 13 <code>ClosedChannelException</code>, 3 <code>Broken pipe</code>, the same as Jenkins.</td></tr>
       <tr><td><b>main + #5098 leaders-only post-cut client</b></td><td class="num"><b>0 / 100</b></td><td>Recovery was still exercised every time: 100 cuts and reopens, and 200/200 "Replication Recovery was successful".</td></tr>
       <tr><td>main + <code>wasCommError</code> also counting Jetty's errors</td><td class="num"><b>0 / 100</b></td><td><code>CloudSolrClient</code> caught and retried 17 would-be failures (15 <code>ClosedChannelException</code>, 2 <code>Broken pipe</code>), matching the 16 in the unchanged run. The missing retry accounts for the whole residual, but this cure replays committed updates, so it isn't safe to ship.</td></tr>
-      <tr><td>branch_9x, pinned (old client, unchanged)</td><td class="num">pending</td><td>20 earlier iterations: 0 failed, 16 rescued by the <code>NoHttpResponseException</code> retry.</td></tr>
-      <tr><td>branch_9x with that retry removed</td><td class="num">pending</td><td>Should start failing if the retry is what protected 9x.</td></tr>
+      <tr><td>branch_9x, pinned (old client, unchanged)</td><td class="num"><b>0 / 100</b></td><td><code>CloudSolrClient</code> retried 99 <code>NoHttpResponseException</code>s (<code>commError=true</code>) and 2 connection resets; recovery 200/200. The old client hits the dead connection on almost every run and is rescued every time.</td></tr>
+      <tr><td><b>branch_9x with that retry removed</b></td><td class="num"><b>85 / 100</b></td><td>84 are the cut-replica failure, with <code>NoHttpResponseException</code> now <code>commError=false</code> (not retried); 1 is unrelated (a core failed to create during setup). Without its retry, the old client fails far more than main's new one.</td></tr>
     </tbody>
   </table>
+  <div class="callout blue"><b>What the five runs prove, from both directions:</b> remove the old
+    client's retry and 9x fails 84% of the time; add the same kind of retry to main and it stops
+    failing. The old client was never protected by its transport; it was rescued by the retry on almost
+    every run. #5098 reaches 0 without touching the client, and recovery is still exercised.</div>
   <p>No client-side retry can be safe here: "committed" means the HEADERS left the client, and in
     general the server may have applied the update. So the fix belongs in the test. The test is about
     how the <i>leader</i> handles an unreachable replica, so its own updates should go to the leader,
@@ -485,7 +489,7 @@ if (!slowFileExists(indexDir, file.get(NAME)) || downloadCompleteIndex) {
     adds the routing difference and an explanation for the remaining failures.</div>
   <h3>The old client fails <i>more</i> on a fresh connection, until <code>CloudSolrClient</code> retries it</h3>
   <div id="chart9x"></div>
-  <p class="muted">Share of updates that ended in an error. Old Apache client on branch_9x, Linux (Docker).</p>
+  <p class="muted">Old Apache client on branch_9x, Linux (Docker). The first three bars count single updates in the experiment harness; the last two count runs of the real test.</p>
   <details><summary>Show as a table</summary><div id="table9x"></div></details>
 
   <h3>Where the retry lives</h3>
@@ -497,8 +501,9 @@ if (!slowFileExists(indexDir, file.get(NAME)) || downloadCompleteIndex) {
 <span class="hl">      || rootCause instanceof NoHttpResponseException;</span>
 }</pre>
       <p>When this is true, <code>CloudSolrClient.requestWithRetryOnStaleState</code> retries the
-        whole update, and the second attempt reaches the leader. In the pinned run, the log shows
-        <code>commError=true … retrying</code> 16 times, and no add failed.</p></div>
+        whole update, and the second attempt reaches the leader. Over 100 pinned runs it retried 99
+        <code>NoHttpResponseException</code>s (<code>commError=true</code>) and no run failed. With the
+        override removed, 84 of 100 runs failed.</p></div>
     <div><b>main</b>: <code>CloudSolrClient.java:213</code> (the subclass is gone)
 <pre>protected boolean wasCommError(Throwable t) {
   return SolrException.hasCause(t, SocketException.class)
@@ -860,7 +865,8 @@ if (!slowFileExists(indexDir, file.get(NAME)) || downloadCompleteIndex) {
     { c: 'Fresh connection|direct', fail: 20, n: 20 },
     { c: 'Fresh connection|via its LB', fail: 35, n: 35 },
     { c: 'Idle 3.5s|via its LB', fail: 0, n: 5 },
-    { c: 'Real 9x test|any-replica, 80 adds', fail: 0, n: 80 },
+    { c: 'Real 9x test|100 runs', fail: 0, n: 100 },
+    { c: 'Real 9x test,|retry removed', fail: 84, n: 100 },
   ];
   function render9x() {
     const host = document.getElementById('chart9x'); host.innerHTML = '';
