@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Solr notes</title>
+<style>
+  body { margin: 0; background: #f9f9f7; color: #0b0b0b;
+         font: 16px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 48px 24px; }
+  h1 { font-size: 28px; margin: 0 0 8px; }
+  p { color: #52514e; }
+  a { color: #2a78d6; }
+  li { margin: 10px 0; }
+  .date { color: #898781; font-size: 14px; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #0d0d0d; color: #fff; } p { color: #c3c2b7; } a { color: #3987e5; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>Solr notes</h1>
+  <p>Interactive write-ups of Apache Solr investigations.</p>
+  <ul>
+    <li><a href="rasct-walkthrough.html">Why RecoveryAfterSoftCommitTest went flaky</a>
+      <span class="date">· 2026-10-24</span><br>
+      How the HTTP/2 test client from SOLR-18188 lets an update go to a just-partitioned replica,
+      commit, and fail without a safe retry. Related: SOLR-18530, apache/solr#5098.</li>
+  </ul>
+</main>
+</body>
+</html>
